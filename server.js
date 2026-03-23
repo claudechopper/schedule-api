@@ -37,12 +37,17 @@ function fixTimes(start, end) {
   let s = parseH(start);
   let e = parseH(end);
 
-  // Rule 1: end before start → end is PM (e.g. 9:00→4:00 becomes 9:00→16:00)
+  // Rule 1: end < start AND end < 12 → end is PM (e.g. 9:00→4:00 becomes 9:00→16:00)
   if (e < s && e < 12) { e += 12; }
 
-  // Rule 2: shift is over 12 hours AND start is 1-8 → start is PM, not AM
-  // (e.g. 1:00→20:00 = 19hr impossible shift → 13:00→20:00 = 7hr normal shift)
+  // Rule 2: duration > 12hrs AND start is 1-8 → start is PM, not AM
+  // (e.g. 1:00→20:00 = 19hr impossible → 13:00→20:00 = 7hr normal)
   if ((e - s) > 12 && s >= 1 && s <= 8) { s += 12; }
+
+  // Rule 3: start > end AND both >= 12 AND (start-12) < end → start is 12hrs too large
+  // (e.g. 21:00→17:15 means Claude read 9AM as 9PM → subtract 12 → 9:00→17:15)
+  // Also catches: 22:00→16:00 → 10:00→16:00, 19:00→13:00 → 7:00→13:00
+  if (s > e && s >= 12 && (s - 12) < e) { s -= 12; }
 
   return { start: fmtT(s), end: fmtT(e) };
 }
