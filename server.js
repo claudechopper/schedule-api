@@ -44,7 +44,7 @@ Return ONLY valid JSON (no markdown, no backticks) in this exact format:
     {
       "name": "Employee Name",
       "shifts": {
-        "Monday": [{"start": "9:00", "end": "17:00"}],
+        "Monday": [{"start": "13:00", "end": "20:00"}],
         "Tuesday": [],
         ...
       }
@@ -52,14 +52,21 @@ Return ONLY valid JSON (no markdown, no backticks) in this exact format:
   ]
 }
 
-Rules:
-- Use 24-hour time format (e.g., 9:00, 13:30, 17:00, 22:00)
+CRITICAL - AM/PM conversion to 24-hour time:
+- Times on the schedule may show as "1:00p", "8:00p", "9:00a", "12:00p" etc.
+- You MUST convert ALL times to 24-hour format before outputting
+- AM conversion: 12:00a = "0:00", 1:00a = "1:00", 9:00a = "9:00", 11:30a = "11:30"
+- PM conversion: 12:00p = "12:00", 1:00p = "13:00", 2:00p = "14:00", 3:00p = "15:00", 4:00p = "16:00", 5:00p = "17:00", 6:00p = "18:00", 7:00p = "19:00", 8:00p = "20:00", 9:00p = "21:00", 10:00p = "22:00", 11:00p = "23:00"
+- Example: a shift showing "1:00p - 8:00p" must be output as start "13:00" end "20:00"
+- Example: a shift showing "9:00a - 4:00p" must be output as start "9:00" end "16:00"
+- Example: a shift showing "6:00a - 1:00p" must be output as start "6:00" end "13:00"
+- NEVER output a PM time as a single digit hour like "1:00" or "8:00" — always convert PM to 13-23 range
+
+Other rules:
 - If an employee has no shift on a day, use an empty array []
-- If a shift spans a lunch break but appears as one block, keep it as one shift
 - Include ALL employees visible, even if they have no shifts
-- Read times as precisely as possible from the visual grid
-- Include every day column shown in the image
-- Pay close attention to where each colored block starts and ends on the time axis`;
+- Read times as precisely as possible from the schedule
+- Include every day column shown in the image`;
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -96,6 +103,49 @@ Rules:
     // Strip any markdown code fences if present
     const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, text];
     const schedule = JSON.parse(jsonMatch[1].trim());
+
+    // Clean up day names — strip trailing date numbers e.g. "Monday 2" → "Monday"
+    const dayNames = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+    schedule.days = schedule.days.map(d => {
+      const match = dayNames.find(n => d.startsWith(n));
+      return match || d;
+    });
+    schedule.employees = schedule.employees.map(emp => {
+      const cleaned = {};
+      for (const [day, shifts] of Object.entries(emp.shifts)) {
+        const match = dayNames.find(n => day.startsWith(n));
+        cleaned[match || day] = shifts;
+      }
+      return { ...emp, shifts: cleaned };
+    });
+
+    // Fix AM/PM time errors mathematically
+    // Rule 1: if end < start, end is PM — add 12
+    // Rule 2: if shift duration > 12 hours and start < 6, start is PM — add 12
+    function parseH(t) {
+      const [h, m] = t.split(':').map(Number);
+      return h + (m || 0) / 60;
+    }
+    function fmtT(h) {
+      const hrs = Math.floor(h);
+      const mins = Math.round((h - hrs) * 60);
+      return `${hrs}:${mins.toString().padStart(2, '0')}`;
+    }
+    schedule.employees = schedule.employees.map(emp => {
+      const fixed = {};
+      for (const [day, shifts] of Object.entries(emp.shifts)) {
+        fixed[day] = shifts.map(s => {
+          let start = parseH(s.start);
+          let end = parseH(s.end);
+          // end before start → end is PM
+          if (end < start && end < 12) end += 12;
+          // shift > 12 hours with small start → start is PM (e.g. 1AM read instead of 1PM)
+          if ((end - start) > 12 && start < 6) start += 12;
+          return { start: fmtT(start), end: fmtT(end) };
+        });
+      }
+      return { ...emp, shifts: fixed };
+    });
 
     res.json({ schedule });
 
