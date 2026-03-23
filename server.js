@@ -52,15 +52,15 @@ Return ONLY valid JSON (no markdown, no backticks) in this exact format:
   ]
 }
 
-CRITICAL - AM/PM conversion to 24-hour time:
-- Times on the schedule may show as "1:00p", "8:00p", "9:00a", "12:00p" etc.
-- You MUST convert ALL times to 24-hour format before outputting
-- AM conversion: 12:00a = "0:00", 1:00a = "1:00", 9:00a = "9:00", 11:30a = "11:30"
-- PM conversion: 12:00p = "12:00", 1:00p = "13:00", 2:00p = "14:00", 3:00p = "15:00", 4:00p = "16:00", 5:00p = "17:00", 6:00p = "18:00", 7:00p = "19:00", 8:00p = "20:00", 9:00p = "21:00", 10:00p = "22:00", 11:00p = "23:00"
-- Example: a shift showing "1:00p - 8:00p" must be output as start "13:00" end "20:00"
-- Example: a shift showing "9:00a - 4:00p" must be output as start "9:00" end "16:00"
-- Example: a shift showing "6:00a - 1:00p" must be output as start "6:00" end "13:00"
-- NEVER output a PM time as a single digit hour like "1:00" or "8:00" — always convert PM to 13-23 range
+CRITICAL - READ THE TIME AXIS REFERENCE:
+- The schedule displays a time axis (usually on left side) with hour labels: 9am, 10am, 11am, 12pm, 1pm, 2pm, 3pm, 4pm, 5pm, 6pm, 7pm, 8pm, etc.
+- Each employee's colored shift block is positioned relative to these axis labels
+- Use the axis labels as your ground truth to read exact times
+- If a shift block sits between the "1pm" and "8pm" labels, output it as start "13:00" end "20:00" (NOT "1:00" or "8:00")
+- If a shift block sits between "6am" and "1pm" labels, output it as start "6:00" end "13:00"
+- Convert all times to proper 24-hour format based on their visual position on the axis
+- Times 0:00-11:59 are morning, times 12:00-23:59 are noon/evening
+- Never output ambiguous single-digit PM times like "1:00", "2:00", "3:00" etc. in the 9am-7pm business window — if you see "1" in the afternoon section, it's "13:00"
 
 Other rules:
 - If an employee has no shift on a day, use an empty array []
@@ -120,8 +120,6 @@ Other rules:
     });
 
     // Fix AM/PM time errors mathematically
-    // Rule 1: if end < start, end is PM — add 12
-    // Rule 2: if shift duration > 12 hours and start < 6, start is PM — add 12
     function parseH(t) {
       const [h, m] = t.split(':').map(Number);
       return h + (m || 0) / 60;
@@ -137,10 +135,38 @@ Other rules:
         fixed[day] = shifts.map(s => {
           let start = parseH(s.start);
           let end = parseH(s.end);
-          // end before start → end is PM
+
+          // Rule 1: if end < start, end is definitely PM — add 12
           if (end < start && end < 12) end += 12;
-          // shift > 12 hours with small start → start is PM (e.g. 1AM read instead of 1PM)
-          if ((end - start) > 12 && start < 6) start += 12;
+
+          // Rule 2: if end is 1-7 and start >= 8, end is PM — add 12
+          // (e.g., 9:00 → 4:00 means 4PM not 4AM)
+          if (end >= 1 && end <= 7 && start >= 8) end += 12;
+
+          // Rule 3: if start is 1-7 and end >= 12, start is PM — add 12
+          // (e.g., 1:00 → 20:00 means 1PM start, not 1AM)
+          if (start >= 1 && start <= 7 && end >= 12) start += 12;
+
+          // Rule 4: shift > 12 hours with small start → start is PM
+          if ((end - start) > 12 && start < 6 && start > 0) start += 12;
+
+          // Rule 5: if both start and end are 1-8 (low numbers), they're probably both PM
+          // (e.g., 1:00 → 8:00 in a 9-7 business = 1PM to 8PM)
+          if (start >= 1 && start <= 8 && end >= 1 && end <= 8 && start <= end) {
+            start += 12;
+            end += 12;
+          }
+
+          // Rule 6: if start is 1-7 but end is > 8, start is PM (e.g., 3:00 → 10:45 = 3PM → 10:45PM)
+          if (start >= 1 && start <= 7 && end > 8) {
+            start += 12;
+          }
+
+          // Rule 7: if after adjustments start > end, end must be PM too — add 12
+          if (start > end && end < 12) {
+            end += 12;
+          }
+
           return { start: fmtT(start), end: fmtT(end) };
         });
       }
