@@ -5,22 +5,25 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Only allow requests from your GitHub Pages site
 app.use(cors({
   origin: [
     'https://claudechopper.github.io',
-    'http://127.0.0.1:5500',
+    'http://127.0.0.1:5500', // for local testing
     'http://localhost:5500'
   ]
 }));
 
 app.use(express.json({ limit: '20mb' }));
 
+// Health check
 app.get('/', (req, res) => {
   res.json({ status: 'Schedule Checker API is running' });
 });
 
+// Main analyze endpoint
 app.post('/analyze', async (req, res) => {
-  const { imageBase64, imageType } = req.body;
+  const { imageBase64, imageType, startHour, endHour, minStaff } = req.body;
 
   if (!imageBase64 || !imageType) {
     return res.status(400).json({ error: 'Missing image data' });
@@ -52,9 +55,11 @@ Return ONLY valid JSON (no markdown, no backticks) in this exact format:
 Rules:
 - Use 24-hour time format (e.g., 9:00, 13:30, 17:00, 22:00)
 - If an employee has no shift on a day, use an empty array []
+- If a shift spans a lunch break but appears as one block, keep it as one shift
 - Include ALL employees visible, even if they have no shifts
 - Read times as precisely as possible from the visual grid
-- Include every day column shown in the image`;
+- Include every day column shown in the image
+- Pay close attention to where each colored block starts and ends on the time axis`;
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -70,7 +75,10 @@ Rules:
         messages: [{
           role: 'user',
           content: [
-            { type: 'image', source: { type: 'base64', media_type: imageType, data: imageBase64 } },
+            {
+              type: 'image',
+              source: { type: 'base64', media_type: imageType, data: imageBase64 }
+            },
             { type: 'text', text: prompt }
           ]
         }]
@@ -84,10 +92,13 @@ Rules:
 
     const data = await response.json();
     const text = data.content[0].text;
+
+    // Strip any markdown code fences if present
     const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, text];
     const schedule = JSON.parse(jsonMatch[1].trim());
 
     res.json({ schedule });
+
   } catch (err) {
     console.error('Error:', err.message);
     res.status(500).json({ error: err.message });
