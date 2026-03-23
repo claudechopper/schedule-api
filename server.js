@@ -5,25 +5,67 @@ const fetch = require('node-fetch');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Only allow requests from your GitHub Pages site
 app.use(cors({
   origin: [
     'https://claudechopper.github.io',
-    'http://127.0.0.1:5500', // for local testing
+    'http://127.0.0.1:5500',
     'http://localhost:5500'
   ]
 }));
 
 app.use(express.json({ limit: '20mb' }));
 
-// Health check
 app.get('/', (req, res) => {
   res.json({ status: 'Schedule Checker API is running' });
 });
 
-// Main analyze endpoint
+// Parse "9:00" or "13:30" into decimal hours
+function parseH(t) {
+  const parts = t.split(':').map(Number);
+  return parts[0] + (parts[1] || 0) / 60;
+}
+
+// Format decimal hours back to "9:00" or "13:30"
+function fmtT(h) {
+  const hrs = Math.floor(h);
+  const mins = Math.round((h - hrs) * 60);
+  return hrs + ':' + mins.toString().padStart(2, '0');
+}
+
+// Fix AM/PM errors where Claude reads 12-hour times without converting to 24-hour
+function fixTimes(start, end) {
+  let s = parseH(start);
+  let e = parseH(end);
+
+  // Rule 1: end < start and end < 12 means end is PM (e.g. 9 to 4 becomes 9 to 16)
+  if (e < s && e < 12) { e += 12; }
+
+  // Rule 2: end is 1-7 and start >= 8 means end is PM (e.g. 9 to 4 becomes 9 to 16)
+  if (e >= 1 && e <= 7 && s >= 8) { e += 12; }
+
+  // Rule 3: both are 1-8 means both are PM (e.g. 1 to 8 becomes 13 to 20)
+  if (s >= 1 && s <= 8 && e >= 1 && e <= 8 && s <= e) {
+    s += 12;
+    e += 12;
+  }
+
+  // Rule 4: start is 1-7 and end is 8-11 means both are PM (e.g. 3 to 10:45 becomes 15 to 22:45)
+  if (s >= 1 && s <= 7 && e >= 8 && e < 12) {
+    s += 12;
+    e += 12;
+  }
+
+  // Rule 5: after fixes if start still > end and end < 12, end is PM
+  if (s > e && e < 12) { e += 12; }
+
+  // Rule 6: shift over 12 hours with small start means start is PM (e.g. 1 to 20 becomes 13 to 20)
+  if ((e - s) > 12 && s < 6 && s > 0) { s += 12; }
+
+  return { start: fmtT(s), end: fmtT(e) };
+}
+
 app.post('/analyze', async (req, res) => {
-  const { imageBase64, imageType, startHour, endHour, minStaff } = req.body;
+  const { imageBase64, imageType } = req.body;
 
   if (!imageBase64 || !imageType) {
     return res.status(400).json({ error: 'Missing image data' });
@@ -34,39 +76,7 @@ app.post('/analyze', async (req, res) => {
     return res.status(500).json({ error: 'API key not configured on server' });
   }
 
-  const prompt = `You are analyzing an employee work schedule image. Extract every employee's shifts for each day of the week shown.
-
-Return ONLY valid JSON (no markdown, no backticks) in this exact format:
-{
-  "week_label": "string describing the week if visible",
-  "days": ["Monday", "Tuesday", ...],
-  "employees": [
-    {
-      "name": "Employee Name",
-      "shifts": {
-        "Monday": [{"start": "13:00", "end": "20:00"}],
-        "Tuesday": [],
-        ...
-      }
-    }
-  ]
-}
-
-CRITICAL - READ THE TIME AXIS REFERENCE:
-- The schedule displays a time axis (usually on left side) with hour labels: 9am, 10am, 11am, 12pm, 1pm, 2pm, 3pm, 4pm, 5pm, 6pm, 7pm, 8pm, etc.
-- Each employee's colored shift block is positioned relative to these axis labels
-- Use the axis labels as your ground truth to read exact times
-- If a shift block sits between the "1pm" and "8pm" labels, output it as start "13:00" end "20:00" (NOT "1:00" or "8:00")
-- If a shift block sits between "6am" and "1pm" labels, output it as start "6:00" end "13:00"
-- Convert all times to proper 24-hour format based on their visual position on the axis
-- Times 0:00-11:59 are morning, times 12:00-23:59 are noon/evening
-- Never output ambiguous single-digit PM times like "1:00", "2:00", "3:00" etc. in the 9am-7pm business window — if you see "1" in the afternoon section, it's "13:00"
-
-Other rules:
-- If an employee has no shift on a day, use an empty array []
-- Include ALL employees visible, even if they have no shifts
-- Read times as precisely as possible from the schedule
-- Include every day column shown in the image`;
+  const prompt = 'You are analyzing an employee work schedule image. Extract every employee shift for each day shown.\n\nReturn ONLY valid JSON with no markdown, no backticks, no explanation:\n{\n  "week_label": "string",\n  "days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],\n  "employees": [\n    {\n      "name": "Employee Name",\n      "shifts": {\n        "Monday": [{"start": "13:00", "end": "20:00"}],\n        "Tuesday": []\n      }\n    }\n  ]\n}\n\nRules:\n- Day names must be plain names only: Monday, Tuesday, etc. No dates or numbers attached\n- All times in 24-hour format. Convert AM/PM: 1p=13:00, 2p=14:00, 3p=15:00, 4p=16:00, 5p=17:00, 6p=18:00, 7p=19:00, 8p=20:00, 9p=21:00, 10p=22:00\n- Morning: 9a=9:00, 10a=10:00, 11a=11:00, 12p=12:00\n- Empty array for days with no shift\n- Include ALL employees even those with zero shifts';
 
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -82,10 +92,7 @@ Other rules:
         messages: [{
           role: 'user',
           content: [
-            {
-              type: 'image',
-              source: { type: 'base64', media_type: imageType, data: imageBase64 }
-            },
+            { type: 'image', source: { type: 'base64', media_type: imageType, data: imageBase64 } },
             { type: 'text', text: prompt }
           ]
         }]
@@ -93,87 +100,37 @@ Other rules:
     });
 
     if (!response.ok) {
-      const err = await response.json().catch(() => ({}));
-      return res.status(response.status).json({ error: err.error?.message || 'Claude API error' });
+      const err = await response.json().catch(function() { return {}; });
+      return res.status(response.status).json({ error: (err.error && err.error.message) || 'Claude API error' });
     }
 
     const data = await response.json();
     const text = data.content[0].text;
 
-    // Strip any markdown code fences if present
     const jsonMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/) || [null, text];
     const schedule = JSON.parse(jsonMatch[1].trim());
 
-    // Clean up day names — strip trailing date numbers e.g. "Monday 2" → "Monday"
     const dayNames = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
-    schedule.days = schedule.days.map(d => {
-      const match = dayNames.find(n => d.startsWith(n));
-      return match || d;
-    });
-    schedule.employees = schedule.employees.map(emp => {
-      const cleaned = {};
-      for (const [day, shifts] of Object.entries(emp.shifts)) {
-        const match = dayNames.find(n => day.startsWith(n));
-        cleaned[match || day] = shifts;
-      }
-      return { ...emp, shifts: cleaned };
+
+    schedule.days = (schedule.days || []).map(function(d) {
+      return dayNames.find(function(n) { return d.startsWith(n); }) || d;
     });
 
-    // Fix AM/PM time errors mathematically
-    function parseH(t) {
-      const [h, m] = t.split(':').map(Number);
-      return h + (m || 0) / 60;
-    }
-    function fmtT(h) {
-      const hrs = Math.floor(h);
-      const mins = Math.round((h - hrs) * 60);
-      return `${hrs}:${mins.toString().padStart(2, '0')}`;
-    }
-    schedule.employees = schedule.employees.map(emp => {
-      const fixed = {};
-      for (const [day, shifts] of Object.entries(emp.shifts)) {
-        fixed[day] = shifts.map(s => {
-          let start = parseH(s.start);
-          let end = parseH(s.end);
-
-          // Rule 1: if end < start, end is definitely PM — add 12
-          if (end < start && end < 12) end += 12;
-
-          // Rule 2: if end is 1-7 and start >= 8, end is PM — add 12
-          // (e.g., 9:00 → 4:00 means 4PM not 4AM)
-          if (end >= 1 && end <= 7 && start >= 8) end += 12;
-
-          // Rule 3: if start is 1-7 and end >= 12, start is PM — add 12
-          // (e.g., 1:00 → 20:00 means 1PM start, not 1AM)
-          if (start >= 1 && start <= 7 && end >= 12) start += 12;
-
-          // Rule 4: shift > 12 hours with small start → start is PM
-          if ((end - start) > 12 && start < 6 && start > 0) start += 12;
-
-          // Rule 5: if both start and end are 1-8 (low numbers), they're probably both PM
-          // (e.g., 1:00 → 8:00 in a 9-7 business = 1PM to 8PM)
-          if (start >= 1 && start <= 8 && end >= 1 && end <= 8 && start <= end) {
-            start += 12;
-            end += 12;
-          }
-
-          // Rule 6: if start is 1-7 but end is > 8, start is PM (e.g., 3:00 → 10:45 = 3PM → 10:45PM)
-          if (start >= 1 && start <= 7 && end > 8) {
-            start += 12;
-          }
-
-          // Rule 7: if after adjustments start > end, end must be PM too — add 12
-          if (start > end && end < 12) {
-            end += 12;
-          }
-
-          return { start: fmtT(start), end: fmtT(end) };
+    schedule.employees = (schedule.employees || []).map(function(emp) {
+      const fixedShifts = {};
+      const entries = Object.entries(emp.shifts || {});
+      for (let i = 0; i < entries.length; i++) {
+        const day = entries[i][0];
+        const shifts = entries[i][1];
+        const cleanDay = dayNames.find(function(n) { return day.startsWith(n); }) || day;
+        fixedShifts[cleanDay] = (shifts || []).map(function(s) {
+          return fixTimes(s.start, s.end);
         });
       }
-      return { ...emp, shifts: fixed };
+      return Object.assign({}, emp, { shifts: fixedShifts });
     });
 
-    res.json({ schedule });
+    res.json({ schedule: schedule });
 
   } catch (err) {
     console.error('Error:', err.message);
@@ -181,6 +138,6 @@ Other rules:
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Schedule Checker API running on port ${PORT}`);
+app.listen(PORT, function() {
+  console.log('Schedule Checker API running on port ' + PORT);
 });
